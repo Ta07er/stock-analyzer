@@ -422,6 +422,49 @@ def build_recommendation(ind, shariah):
     return verdict, score, reasons
 
 
+def auto_trade_decision(ind, shariah, mode, holding_qty):
+    """
+    قرار التداول الآلي بناءً على التحليل والنمط.
+    mode: 'scalp' (مضاربة) أو 'invest' (استثمار)
+    holding_qty: الكمية المملوكة حالياً من السهم
+    يرجع: (action, reason)  حيث action ∈ {'buy','sell','hold'}
+    """
+    c = ind["current"]
+    rsi = ind["rsi"]
+    macd_up = ind["macd"] > ind["macd_signal"]
+    above50 = c > ind["sma50"]
+    above200 = ind["sma200"] is not None and c > ind["sma200"]
+
+    if mode == "invest":
+        # الاستثمار: يحترم الفلتر الشرعي ويعتمد الاتجاه الطويل
+        if not shariah["passed"]:
+            if holding_qty > 0:
+                return "sell", "السهم لا يجتاز الفلتر الشرعي — تصفية المركز."
+            return "hold", "السهم لا يجتاز الفلتر الشرعي — لا شراء."
+        if holding_qty == 0:
+            if above200 and above50 and macd_up:
+                return "buy", "اتجاه طويل صاعد (فوق متوسطي 50 و200) وزخم MACD إيجابي."
+            return "hold", "لم تكتمل شروط الاتجاه الصاعد طويل المدى."
+        else:
+            if not above200 or rsi > 78:
+                return "sell", "كسر الاتجاه الطويل أو تشبّع شرائي حاد — جني/حماية."
+            return "hold", "الاتجاه الطويل لا يزال صاعداً — استمرار الاحتفاظ."
+
+    # المضاربة: إشارات سريعة
+    if holding_qty == 0:
+        if rsi < 35 and macd_up:
+            return "buy", f"تشبّع بيعي (RSI={rsi:.0f}) مع تقاطع MACD إيجابي — دخول مضاربي."
+        if above50 and macd_up and rsi < 65:
+            return "buy", "زخم إيجابي فوق متوسط 50 وRSI غير متشبّع — دخول."
+        return "hold", "لا توجد إشارة دخول مضاربية واضحة."
+    else:
+        if rsi > 70:
+            return "sell", f"تشبّع شرائي (RSI={rsi:.0f}) — جني أرباح."
+        if not macd_up and not above50:
+            return "sell", "انعكاس الزخم وكسر متوسط 50 — خروج."
+        return "hold", "المركز لا يزال ضمن إشارة إيجابية."
+
+
 # =============================================================
 #  واجهة المستخدم الرسومية
 # =============================================================
@@ -448,6 +491,16 @@ class StockApp(tk.Tk):
         self.alert_levels = {}       # {نوع: سعر} نقاط التنبيه للسهم الحالي
         self.alert_fired = set()     # لتفادي تكرار نفس التنبيه
 
+        # حالة محرّك التداول الآلي
+        self.bot_on = False
+        self.bot_job = None
+        self.bot_win = None
+        self.bot_log_widget = None
+        self.bot_mode = "scalp"
+        self.bot_tickers = []
+        self.bot_interval = 60
+        self.bot_trade_qty = 5
+
         self._build_styles()
         self._build_header()
         self._build_body()
@@ -465,11 +518,13 @@ class StockApp(tk.Tk):
         self.cfg["favorites"] = self.favorites
         self.cfg["refresh_seconds"] = self.refresh_seconds
         save_config(self.cfg)
-        if self._refresh_job:
-            try:
-                self.after_cancel(self._refresh_job)
-            except Exception:
-                pass
+        self.bot_on = False
+        for job in (self._refresh_job, self.bot_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
         self.destroy()
 
     def _build_styles(self):
@@ -535,6 +590,11 @@ class StockApp(tk.Tk):
                                     bg="#30363d", fg="#d29922", font=("Segoe UI", 11, "bold"),
                                     relief="flat", padx=14, pady=6, cursor="hand2")
         self.whatif_btn.pack(side="left", padx=4)
+
+        self.bot_btn = tk.Button(entry_frame, text="🤖 المحرّك", command=self.open_bot,
+                                 bg="#30363d", fg="#f778ba", font=("Segoe UI", 11, "bold"),
+                                 relief="flat", padx=14, pady=6, cursor="hand2")
+        self.bot_btn.pack(side="left", padx=4)
 
         self.sim_btn = tk.Button(entry_frame, text="🧮 محاكاة", command=self.open_simulator,
                                  bg="#30363d", fg="#2dd4bf", font=("Segoe UI", 11, "bold"),
@@ -1712,6 +1772,179 @@ class StockApp(tk.Tk):
                   font=("Segoe UI", 10, "bold"), relief="flat", padx=12, cursor="hand2").pack(side="right", padx=6)
 
         refresh_view()
+
+
+    # =========================================================
+    #  محرّك التداول الآلي (محاكاة)
+    # =========================================================
+    def open_bot(self):
+        if self.bot_win and tk.Toplevel.winfo_exists(self.bot_win):
+            self.bot_win.lift()
+            return
+        win = tk.Toplevel(self)
+        self.bot_win = win
+        win.title("محرّك التداول الآلي")
+        win.geometry("780x640")
+        win.configure(bg=self.col_bg)
+
+        tk.Label(win, text="🤖 محرّك التداول الآلي (محاكاة)", bg=self.col_bg,
+                 fg="#f778ba", font=("Segoe UI", 16, "bold")).pack(pady=10)
+
+        # الإعدادات
+        cfgf = tk.Frame(win, bg=self.col_panel); cfgf.pack(fill="x", padx=16, pady=6)
+
+        tk.Label(cfgf, text="النمط:", bg=self.col_panel, fg=self.col_text,
+                 font=("Segoe UI", 10)).grid(row=0, column=0, padx=6, pady=6, sticky="e")
+        mode_var = tk.StringVar(value="مضاربة")
+        ttk.Combobox(cfgf, textvariable=mode_var, values=["مضاربة", "استثمار"],
+                     state="readonly", width=10).grid(row=0, column=1, padx=6)
+
+        tk.Label(cfgf, text="الأسهم (مفصولة بفواصل):", bg=self.col_panel, fg=self.col_text,
+                 font=("Segoe UI", 10)).grid(row=0, column=2, padx=6, sticky="e")
+        default_syms = ", ".join(self.favorites) if self.favorites else "AAPL, MSFT, NVDA"
+        syms_var = tk.StringVar(value=default_syms)
+        tk.Entry(cfgf, textvariable=syms_var, width=26, font=("Consolas", 10),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat").grid(row=0, column=3, padx=6, ipady=3)
+
+        tk.Label(cfgf, text="كمية كل صفقة:", bg=self.col_panel, fg=self.col_text,
+                 font=("Segoe UI", 10)).grid(row=1, column=0, padx=6, pady=6, sticky="e")
+        qty_var = tk.StringVar(value="5")
+        tk.Entry(cfgf, textvariable=qty_var, width=8, justify="center", font=("Consolas", 10),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat").grid(row=1, column=1, padx=6, ipady=3)
+
+        tk.Label(cfgf, text="كل (ثانية):", bg=self.col_panel, fg=self.col_text,
+                 font=("Segoe UI", 10)).grid(row=1, column=2, padx=6, sticky="e")
+        intv_var = tk.StringVar(value="60")
+        tk.Entry(cfgf, textvariable=intv_var, width=8, justify="center", font=("Consolas", 10),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat").grid(row=1, column=3, padx=6, ipady=3, sticky="w")
+
+        # سجل القرارات
+        log = tk.Text(win, bg="#0b0f14", fg=self.col_text, font=("Consolas", 10),
+                      relief="flat", wrap="word", padx=12, pady=12)
+        log.pack(fill="both", expand=True, padx=16, pady=8)
+        log.tag_configure("buy", foreground="#3fb950")
+        log.tag_configure("sell", foreground="#f85149")
+        log.tag_configure("hold", foreground="#8b949e")
+        log.tag_configure("head", foreground="#f778ba", font=("Segoe UI", 11, "bold"))
+        log.config(state="disabled")
+        self.bot_log_widget = log
+
+        st = tk.Label(win, text="المحرّك متوقف.", bg=self.col_bg, fg="#8b949e",
+                      font=("Segoe UI", 10))
+        st.pack(pady=4)
+        self.bot_status_lbl = st
+
+        def start_stop():
+            if self.bot_on:
+                self.bot_on = False
+                if self.bot_job:
+                    self.after_cancel(self.bot_job); self.bot_job = None
+                start_btn.config(text="▶ تشغيل المحرّك", bg="#238636")
+                st.config(text="المحرّك متوقف.", fg="#8b949e")
+                return
+            # قراءة الإعدادات
+            self.bot_mode = "scalp" if mode_var.get() == "مضاربة" else "invest"
+            self.bot_tickers = [t.strip().upper() for t in syms_var.get().split(",") if t.strip()]
+            try:
+                self.bot_trade_qty = max(1, int(qty_var.get()))
+                self.bot_interval = max(10, int(intv_var.get()))
+            except ValueError:
+                self.bot_trade_qty, self.bot_interval = 5, 60
+            if not self.bot_tickers:
+                messagebox.showinfo("تنبيه", "أدخل رمز سهم واحد على الأقل.", parent=win)
+                return
+            self.bot_on = True
+            start_btn.config(text="⏸ إيقاف المحرّك", bg="#da3633")
+            self._bot_log(f"بدأ المحرّك | النمط: {mode_var.get()} | الأسهم: {', '.join(self.bot_tickers)} "
+                          f"| كل {self.bot_interval}ث", "head")
+            self._bot_cycle()
+
+        start_btn = tk.Button(win, text="▶ تشغيل المحرّك", command=start_stop,
+                              bg="#238636", fg="white", font=("Segoe UI", 12, "bold"),
+                              relief="flat", padx=24, pady=8, cursor="hand2")
+        start_btn.pack(pady=6)
+
+        tk.Label(win, text="⚠️ محاكاة تعليمية فقط — لا تضمن نتائج حقيقية ولا تُعد توصية استثمارية.",
+                 bg=self.col_bg, fg="#d29922", font=("Segoe UI", 9)).pack(pady=4)
+
+        def on_bot_close():
+            self.bot_on = False
+            if self.bot_job:
+                self.after_cancel(self.bot_job); self.bot_job = None
+            self.bot_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_bot_close)
+
+    def _bot_log(self, text, tag=None):
+        w = self.bot_log_widget
+        if not w:
+            return
+        now = dt.datetime.now().strftime("%H:%M:%S")
+        w.config(state="normal")
+        w.insert("end", f"[{now}] {text}\n", tag)
+        w.see("end")
+        w.config(state="disabled")
+
+    def _bot_cycle(self):
+        if not self.bot_on:
+            return
+        threading.Thread(target=self._bot_worker, daemon=True).start()
+        self.bot_job = self.after(self.bot_interval * 1000, self._bot_cycle)
+
+    def _bot_worker(self):
+        p = self.cfg["portfolio"]
+        for sym in self.bot_tickers:
+            if not self.bot_on:
+                return
+            try:
+                hist, info, bs, fin = fetch_data(sym)
+                shariah = shariah_screen(info, bs)
+                ind = technical_analysis(hist)
+                holding = p["positions"].get(sym, {"qty": 0}).get("qty", 0)
+                action, reason = auto_trade_decision(ind, shariah, self.bot_mode, holding)
+                price = ind["current"]
+                self.after(0, self._bot_execute, sym, action, reason, price)
+            except Exception as e:
+                self.after(0, self._bot_log, f"{sym}: تعذّر التحليل ({e})", "hold")
+
+    def _bot_execute(self, sym, action, reason, price):
+        p = self.cfg["portfolio"]
+        pos = p["positions"].get(sym, {"qty": 0, "avg": 0.0})
+        qty = self.bot_trade_qty
+
+        if action == "buy":
+            cost = price * qty
+            if cost > p["cash"]:
+                self._bot_log(f"{sym}: إشارة شراء لكن النقد غير كافٍ. ({reason})", "hold")
+                return
+            new_qty = pos["qty"] + qty
+            pos["avg"] = (pos["avg"] * pos["qty"] + cost) / new_qty
+            pos["qty"] = new_qty
+            p["cash"] -= cost
+            p["positions"][sym] = pos
+            p["trades"].append({"time": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                "side": "buy", "ticker": sym, "qty": qty, "price": round(price, 2)})
+            save_config(self.cfg)
+            self._bot_log(f"🟢 شراء {qty} {sym} @ {price:.2f}$ — {reason}", "buy")
+
+        elif action == "sell":
+            if pos["qty"] <= 0:
+                self._bot_log(f"{sym}: إشارة بيع لكن لا يوجد مركز. ({reason})", "hold")
+                return
+            sell_qty = min(qty, pos["qty"])
+            proceeds = price * sell_qty
+            pl = (price - pos["avg"]) * sell_qty
+            p["cash"] += proceeds
+            pos["qty"] -= sell_qty
+            p["positions"][sym] = pos
+            p["trades"].append({"time": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                "side": "sell", "ticker": sym, "qty": sell_qty, "price": round(price, 2)})
+            save_config(self.cfg)
+            tag = "buy" if pl >= 0 else "sell"
+            self._bot_log(f"🔴 بيع {sell_qty} {sym} @ {price:.2f}$ (ربح/خسارة {pl:+.2f}$) — {reason}", "sell")
+
+        else:
+            self._bot_log(f"⏸ انتظار {sym} @ {price:.2f}$ — {reason}", "hold")
 
 
 if __name__ == "__main__":
