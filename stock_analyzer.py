@@ -41,6 +41,11 @@ except ImportError:
 from matplotlib.backends.backend_pdf import PdfPages
 import os
 import json
+import sys
+import urllib.request
+
+# رابط أحدث نسخة من الكود (GitHub)
+UPDATE_URL = "https://raw.githubusercontent.com/Ta07er/stock-analyzer/main/stock_analyzer.py"
 
 # إشعار ويندوز سطح المكتب (اختياري)
 try:
@@ -61,9 +66,18 @@ CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".stock_analyzer_config.json
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
-        return {"favorites": [], "refresh_seconds": 30}
+        cfg = {}
+    cfg.setdefault("favorites", [])
+    cfg.setdefault("refresh_seconds", 30)
+    cfg.setdefault("portfolio", {
+        "start_balance": 100000.0,
+        "cash": 100000.0,
+        "positions": {},      # {ticker: {"qty": int, "avg": float}}
+        "trades": [],         # سجل الصفقات
+    })
+    return cfg
 
 
 def save_config(cfg):
@@ -197,6 +211,61 @@ def fetch_quick(ticker):
         intraday = tk_obj.history(period="5d")
     price = float(intraday["Close"].iloc[-1])
     return price, intraday
+
+
+def get_price(ticker):
+    """جلب آخر سعر لرمز واحد (للمحفظة)."""
+    tk_obj = yf.Ticker(ticker)
+    h = tk_obj.history(period="1d")
+    if h is None or h.empty:
+        h = tk_obj.history(period="5d")
+    return float(h["Close"].iloc[-1])
+
+
+_RATE_CACHE = {"rate": None, "ts": None}
+
+
+def usd_to_sar():
+    """سعر صرف الدولار مقابل الريال (يُجلب حقيقياً مع تخزين مؤقت)."""
+    now = dt.datetime.now()
+    if _RATE_CACHE["rate"] and _RATE_CACHE["ts"] and (now - _RATE_CACHE["ts"]).seconds < 3600:
+        return _RATE_CACHE["rate"]
+    rate = 3.75  # القيمة المثبّتة تقريبياً (الريال مربوط بالدولار)
+    try:
+        fx = yf.Ticker("SAR=X").history(period="1d")
+        if fx is not None and not fx.empty:
+            rate = float(fx["Close"].iloc[-1])
+    except Exception:
+        pass
+    _RATE_CACHE["rate"] = rate
+    _RATE_CACHE["ts"] = now
+    return rate
+
+
+def fetch_usd_sar():
+    """جلب سعر صرف الدولار مقابل الريال السعودي (حي من السوق)."""
+    try:
+        fx = yf.Ticker("SAR=X").history(period="5d")
+        if fx is not None and not fx.empty:
+            return float(fx["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 3.75  # سعر الربط التقريبي كقيمة احتياطية
+
+
+def scenario_returns(hist):
+    """حساب سيناريوهات العائد بناءً على التقلب التاريخي للسهم (سنة)."""
+    close = hist["Close"]
+    daily = close.pct_change().dropna()
+    if len(daily) < 20:
+        return {"متفائل": 0.15, "متوسط": 0.05, "متشائم": -0.10}
+    ann_ret = float(daily.mean() * 252)
+    ann_vol = float(daily.std() * (252 ** 0.5))
+    return {
+        "متفائل": ann_ret + ann_vol,
+        "متوسط": ann_ret,
+        "متشائم": ann_ret - ann_vol,
+    }
 
 
 def _get_row(df, names):
@@ -372,6 +441,8 @@ class StockApp(tk.Tk):
         self.cfg = load_config()
         self.favorites = self.cfg.get("favorites", [])
         self.refresh_seconds = self.cfg.get("refresh_seconds", 30)
+        self.portfolio = self.cfg.get("portfolio", None)  # {cash, start, holdings:{t:{qty,avg}}, history:[]}
+        self.usd_sar = 3.75
         self.auto_on = False
         self._refresh_job = None
         self.alert_levels = {}       # {نوع: سعر} نقاط التنبيه للسهم الحالي
@@ -449,6 +520,31 @@ class StockApp(tk.Tk):
                                  bg="#30363d", fg=self.col_text, font=("Segoe UI", 11, "bold"),
                                  relief="flat", padx=14, pady=6, cursor="hand2")
         self.cmp_btn.pack(side="left", padx=4)
+
+        self.upd_btn = tk.Button(entry_frame, text="🔄 تحديث", command=self.check_update,
+                                 bg="#30363d", fg="#a371f7", font=("Segoe UI", 11, "bold"),
+                                 relief="flat", padx=14, pady=6, cursor="hand2")
+        self.upd_btn.pack(side="left", padx=4)
+
+        self.port_btn = tk.Button(entry_frame, text="💼 المحفظة", command=self.open_portfolio,
+                                  bg="#30363d", fg="#2dd4bf", font=("Segoe UI", 11, "bold"),
+                                  relief="flat", padx=14, pady=6, cursor="hand2")
+        self.port_btn.pack(side="left", padx=4)
+
+        self.whatif_btn = tk.Button(entry_frame, text="🧮 ماذا لو", command=self.open_whatif,
+                                    bg="#30363d", fg="#d29922", font=("Segoe UI", 11, "bold"),
+                                    relief="flat", padx=14, pady=6, cursor="hand2")
+        self.whatif_btn.pack(side="left", padx=4)
+
+        self.sim_btn = tk.Button(entry_frame, text="🧮 محاكاة", command=self.open_simulator,
+                                 bg="#30363d", fg="#2dd4bf", font=("Segoe UI", 11, "bold"),
+                                 relief="flat", padx=14, pady=6, cursor="hand2")
+        self.sim_btn.pack(side="left", padx=4)
+
+        self.port_btn = tk.Button(entry_frame, text="💼 المحفظة", command=self.open_portfolio,
+                                  bg="#30363d", fg="#d29922", font=("Segoe UI", 11, "bold"),
+                                  relief="flat", padx=14, pady=6, cursor="hand2")
+        self.port_btn.pack(side="left", padx=4)
 
         # صف ثانٍ: المفضلة والتحديث التلقائي
         bar = tk.Frame(self, bg=self.col_bg)
@@ -1019,6 +1115,603 @@ class StockApp(tk.Tk):
                 pass
         # نافذة منبثقة داخل التطبيق
         messagebox.showinfo("🔔 تنبيه سعري", msg)
+
+
+    # =========================================================
+    #  التحديث الذاتي من الإنترنت
+    # =========================================================
+    def check_update(self):
+        if not messagebox.askyesno(
+            "تحديث التطبيق",
+            "سيتم تنزيل أحدث نسخة من الكود من الإنترنت واستبدال الملف الحالي.\n"
+            "هل تريد المتابعة؟"):
+            return
+        self.upd_btn.config(state="disabled", text="...")
+        self.status.config(text="جاري التحقق من التحديثات ...", fg=self.col_accent)
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        try:
+            req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "StockAnalyzer"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                new_code = resp.read().decode("utf-8")
+
+            if "class StockApp" not in new_code or len(new_code) < 500:
+                raise ValueError("الملف المُنزّل غير صالح.")
+
+            # المسار الحالي للملف قيد التشغيل
+            current_path = os.path.abspath(sys.argv[0])
+            if not current_path.endswith(".py"):
+                # التطبيق يعمل كـ exe — لا يمكن استبدال الكود مباشرة
+                self.after(0, self._update_done_exe)
+                return
+
+            with open(current_path, "r", encoding="utf-8") as f:
+                old_code = f.read()
+
+            if old_code == new_code:
+                self.after(0, lambda: self._update_finish("أنت تستخدم أحدث نسخة بالفعل ✓", False))
+                return
+
+            # نسخة احتياطية ثم الكتابة
+            backup = current_path + ".bak"
+            with open(backup, "w", encoding="utf-8") as f:
+                f.write(old_code)
+            with open(current_path, "w", encoding="utf-8") as f:
+                f.write(new_code)
+
+            self.after(0, lambda: self._update_finish(
+                "تم التحديث بنجاح ✓ أعد تشغيل التطبيق لتطبيق التغييرات.", True))
+        except Exception as e:
+            self.after(0, lambda: self._update_finish(f"تعذّر التحديث: {e}", False))
+
+    def _update_done_exe(self):
+        self.upd_btn.config(state="normal", text="🔄 تحديث")
+        self.status.config(text="التطبيق يعمل كـ exe.", fg="#d29922")
+        messagebox.showinfo(
+            "تحديث",
+            "أنت تشغّل النسخة المبنية (exe)، ولا يمكن تحديث الكود داخلها مباشرة.\n\n"
+            "للتحديث التلقائي شغّل التطبيق من ملف stock_analyzer.py مباشرة، "
+            "أو أعد بناء الـ exe بعد تنزيل النسخة الجديدة.")
+
+    def _update_finish(self, msg, success):
+        self.upd_btn.config(state="normal", text="🔄 تحديث")
+        self.status.config(text=msg, fg="#3fb950" if success else "#d29922")
+        if success:
+            messagebox.showinfo("تم التحديث", msg)
+        else:
+            messagebox.showinfo("تحديث", msg)
+
+
+    # =========================================================
+    #  حاسبة المحاكاة
+    # =========================================================
+    def open_simulator(self):
+        if not self.last:
+            messagebox.showinfo("تنبيه", "حلّل سهماً أولاً قبل المحاكاة.")
+            return
+        d = self.last
+        ind = d["ind"]
+        price = ind["current"]
+        ticker = d["ticker"]
+
+        win = tk.Toplevel(self)
+        win.title(f"محاكاة استثمار - {ticker}")
+        win.geometry("620x640")
+        win.configure(bg=self.col_bg)
+
+        try:
+            rate = fetch_usd_sar()
+        except Exception:
+            rate = 3.75
+        self.usd_sar = rate
+
+        tk.Label(win, text=f"🧮 محاكاة استثمار في {ticker}", bg=self.col_bg,
+                 fg=self.col_accent, font=("Segoe UI", 16, "bold")).pack(pady=12)
+        tk.Label(win, text=f"السعر الحالي: {price:.2f} USD  =  {price*rate:.2f} SAR",
+                 bg=self.col_bg, fg=self.col_text, font=("Segoe UI", 11)).pack()
+
+        frm = tk.Frame(win, bg=self.col_bg); frm.pack(pady=10)
+        tk.Label(frm, text="المبلغ المستثمر:", bg=self.col_bg, fg=self.col_text,
+                 font=("Segoe UI", 11)).grid(row=0, column=0, padx=6, pady=6)
+        amt_var = tk.StringVar(value="100")
+        tk.Entry(frm, textvariable=amt_var, width=12, justify="center", font=("Consolas", 13),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat",
+                 insertbackground=self.col_accent).grid(row=0, column=1, padx=6, ipady=4)
+        cur_var = tk.StringVar(value="USD")
+        ttk.Combobox(frm, textvariable=cur_var, values=["USD", "SAR"], width=6,
+                     state="readonly").grid(row=0, column=2, padx=6)
+
+        out = tk.Text(win, bg=self.col_panel, fg=self.col_text, font=("Consolas", 11),
+                      relief="flat", wrap="word", padx=16, pady=16, height=24)
+        out.pack(fill="both", expand=True, padx=16, pady=10)
+        out.tag_configure("title", font=("Segoe UI", 13, "bold"), foreground=self.col_accent)
+        out.tag_configure("good", foreground="#3fb950")
+        out.tag_configure("bad", foreground="#f85149")
+        out.tag_configure("warn", foreground="#d29922")
+
+        def calc():
+            try:
+                amount = float(amt_var.get())
+            except ValueError:
+                return
+            usd_amount = amount if cur_var.get() == "USD" else amount / rate
+            shares = usd_amount / price
+
+            out.config(state="normal"); out.delete("1.0", "end")
+
+            def line(t, tag=None): out.insert("end", t + "\n", tag)
+
+            line(f"باستثمار {amount:.2f} {cur_var.get()} ({usd_amount:.2f} USD)", "title")
+            line(f"تشتري ما يعادل {shares:.4f} سهم بسعر {price:.2f} USD")
+            line("")
+
+            # 1) توقع بسيط على الهدف ووقف الخسارة
+            line("◆ التوقع البسيط (حسب نقاط التحليل):", "title")
+            for label, lvl, tag in [("الهدف (خروج)", ind["target"], "good"),
+                                    ("وقف الخسارة", ind["stop"], "bad")]:
+                val = shares * lvl
+                val_sar = val * rate
+                pct = (lvl - price) / price * 100
+                profit = val - usd_amount
+                line(f"  لو وصل {label} عند {lvl:.2f}:", None)
+                line(f"     القيمة = {val:.2f} USD ({val_sar:.2f} SAR) | "
+                     f"{'ربح' if profit>=0 else 'خسارة'} {abs(profit):.2f} USD ({pct:+.1f}%)",
+                     "good" if profit >= 0 else "bad")
+            line("")
+
+            # 2) سيناريوهات (سنة) بناءً على أداء السهم
+            line("◆ سيناريوهات بعد سنة (حسب أداء السهم التاريخي):", "title")
+            scen = scenario_returns(d["hist"])
+            for name_s, r in scen.items():
+                fv = usd_amount * (1 + r)
+                fv_sar = fv * rate
+                tag = "good" if r >= 0 else "bad"
+                line(f"  {name_s}: عائد {r*100:+.1f}%  →  {fv:.2f} USD ({fv_sar:.2f} SAR)", tag)
+            line("")
+            line(f"سعر الصرف المستخدم: 1 USD = {rate:.3f} SAR", "warn")
+            line("")
+            line("⚠️ المحاكاة تقديرية لأغراض تعليمية، والسيناريوهات مبنية على "
+                 "الأداء السابق ولا تضمن النتائج المستقبلية.", "warn")
+            out.config(state="disabled")
+
+        tk.Button(frm, text="احسب", command=calc, bg=self.col_accent, fg="#0f1419",
+                  font=("Segoe UI", 11, "bold"), relief="flat", padx=18,
+                  cursor="hand2").grid(row=0, column=3, padx=8)
+        calc()
+
+    # =========================================================
+    #  المحفظة الافتراضية
+    # =========================================================
+    def _save_portfolio(self):
+        self.cfg["portfolio"] = self.portfolio
+        save_config(self.cfg)
+
+    def open_portfolio(self):
+        # تهيئة المحفظة لأول مرة
+        if not self.portfolio:
+            amt = self._ask_initial_balance()
+            if amt is None:
+                return
+            self.portfolio = {"cash": amt, "start": amt, "holdings": {}, "history": []}
+            self._save_portfolio()
+
+        win = tk.Toplevel(self)
+        win.title("المحفظة الافتراضية")
+        win.geometry("820x640")
+        win.configure(bg=self.col_bg)
+        self._port_win = win
+
+        try:
+            self.usd_sar = fetch_usd_sar()
+        except Exception:
+            self.usd_sar = 3.75
+
+        # شريط العمليات
+        top = tk.Frame(win, bg=self.col_bg); top.pack(fill="x", padx=16, pady=12)
+        tk.Label(top, text="الرمز:", bg=self.col_bg, fg=self.col_text,
+                 font=("Segoe UI", 11)).pack(side="left")
+        t_var = tk.StringVar(value=self.ticker_var.get().strip().upper() or "AAPL")
+        tk.Entry(top, textvariable=t_var, width=8, justify="center", font=("Consolas", 12),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat",
+                 insertbackground=self.col_accent).pack(side="left", padx=6, ipady=3)
+        tk.Label(top, text="الكمية:", bg=self.col_bg, fg=self.col_text,
+                 font=("Segoe UI", 11)).pack(side="left")
+        q_var = tk.StringVar(value="1")
+        tk.Entry(top, textvariable=q_var, width=6, justify="center", font=("Consolas", 12),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat",
+                 insertbackground=self.col_accent).pack(side="left", padx=6, ipady=3)
+
+        tk.Button(top, text="🟢 شراء", command=lambda: self._trade(t_var, q_var, "buy"),
+                  bg="#238636", fg="white", font=("Segoe UI", 11, "bold"),
+                  relief="flat", padx=14, cursor="hand2").pack(side="left", padx=4)
+        tk.Button(top, text="🔴 بيع", command=lambda: self._trade(t_var, q_var, "sell"),
+                  bg="#da3633", fg="white", font=("Segoe UI", 11, "bold"),
+                  relief="flat", padx=14, cursor="hand2").pack(side="left", padx=4)
+        tk.Button(top, text="🔄 تحديث القيم", command=self._refresh_portfolio,
+                  bg="#30363d", fg=self.col_text, font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, cursor="hand2").pack(side="right")
+
+        # ملخص
+        self._port_summary = tk.Label(win, text="", bg=self.col_bg, fg=self.col_text,
+                                      font=("Segoe UI", 12), justify="right")
+        self._port_summary.pack(fill="x", padx=16, pady=4)
+
+        # جدول الحيازات
+        cols = ("الرمز", "الكمية", "متوسط الشراء", "السعر الحالي", "القيمة USD", "الربح/الخسارة")
+        self._port_tree = ttk.Treeview(win, columns=cols, show="headings", height=12)
+        for c in cols:
+            self._port_tree.heading(c, text=c)
+            self._port_tree.column(c, anchor="center", width=125)
+        self._port_tree.pack(fill="both", expand=True, padx=16, pady=8)
+
+        tk.Button(win, text="إعادة تعيين المحفظة", command=self._reset_portfolio,
+                  bg="#30363d", fg="#f85149", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=12, cursor="hand2").pack(pady=6)
+
+        self._refresh_portfolio()
+
+    def _ask_initial_balance(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("الرصيد الابتدائي")
+        dlg.geometry("360x200")
+        dlg.configure(bg=self.col_bg)
+        dlg.transient(self); dlg.grab_set()
+        tk.Label(dlg, text="أدخل الرصيد الابتدائي للمحفظة:", bg=self.col_bg,
+                 fg=self.col_text, font=("Segoe UI", 12)).pack(pady=16)
+        v = tk.StringVar(value="10000")
+        tk.Entry(dlg, textvariable=v, width=14, justify="center", font=("Consolas", 14),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat",
+                 insertbackground=self.col_accent).pack(pady=4, ipady=4)
+        cv = tk.StringVar(value="USD")
+        ttk.Combobox(dlg, textvariable=cv, values=["USD", "SAR"], width=8,
+                     state="readonly").pack(pady=4)
+        result = {"val": None}
+
+        def ok():
+            try:
+                amt = float(v.get())
+                if cv.get() == "SAR":
+                    amt = amt / (self.usd_sar or 3.75)
+                result["val"] = amt
+            except ValueError:
+                result["val"] = None
+            dlg.destroy()
+
+        tk.Button(dlg, text="ابدأ", command=ok, bg=self.col_accent, fg="#0f1419",
+                  font=("Segoe UI", 11, "bold"), relief="flat", padx=20,
+                  cursor="hand2").pack(pady=10)
+        self.wait_window(dlg)
+        return result["val"]
+
+    def _trade(self, t_var, q_var, side):
+        ticker = t_var.get().strip().upper()
+        try:
+            qty = float(q_var.get())
+        except ValueError:
+            messagebox.showinfo("تنبيه", "أدخل كمية صحيحة."); return
+        if not ticker or qty <= 0:
+            return
+        try:
+            price, _ = fetch_quick(ticker)
+        except Exception as e:
+            messagebox.showerror("خطأ", f"تعذّر جلب سعر {ticker}: {e}"); return
+
+        p = self.portfolio
+        cost = qty * price
+        if side == "buy":
+            if cost > p["cash"]:
+                messagebox.showinfo("رصيد غير كافٍ",
+                                    f"تحتاج {cost:.2f} USD والرصيد {p['cash']:.2f} USD.")
+                return
+            p["cash"] -= cost
+            h = p["holdings"].get(ticker, {"qty": 0, "avg": 0})
+            new_qty = h["qty"] + qty
+            h["avg"] = (h["avg"] * h["qty"] + cost) / new_qty
+            h["qty"] = new_qty
+            p["holdings"][ticker] = h
+        else:  # sell
+            h = p["holdings"].get(ticker)
+            if not h or h["qty"] < qty:
+                messagebox.showinfo("كمية غير كافية",
+                                    f"لا تملك {qty} سهم من {ticker}.")
+                return
+            p["cash"] += cost
+            h["qty"] -= qty
+            if h["qty"] <= 1e-9:
+                del p["holdings"][ticker]
+            else:
+                p["holdings"][ticker] = h
+
+        p["history"].append({
+            "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "side": side, "ticker": ticker, "qty": qty, "price": price})
+        self._save_portfolio()
+        self._refresh_portfolio()
+
+    def _refresh_portfolio(self):
+        if not self.portfolio or not hasattr(self, "_port_tree"):
+            return
+        threading.Thread(target=self._port_worker, daemon=True).start()
+
+    def _port_worker(self):
+        p = self.portfolio
+        prices = {}
+        for t in list(p["holdings"].keys()):
+            try:
+                pr, _ = fetch_quick(t)
+                prices[t] = pr
+            except Exception:
+                prices[t] = p["holdings"][t]["avg"]
+        self.after(0, self._port_render, prices)
+
+    def _port_render(self, prices):
+        p = self.portfolio
+        rate = self.usd_sar or 3.75
+        for r in self._port_tree.get_children():
+            self._port_tree.delete(r)
+        holdings_value = 0.0
+        for t, h in p["holdings"].items():
+            cur = prices.get(t, h["avg"])
+            val = h["qty"] * cur
+            holdings_value += val
+            pl = (cur - h["avg"]) * h["qty"]
+            self._port_tree.insert("", "end", values=(
+                t, f"{h['qty']:.2f}", f"{h['avg']:.2f}", f"{cur:.2f}",
+                f"{val:.2f}", f"{pl:+.2f}"))
+        total = p["cash"] + holdings_value
+        pl_total = total - p["start"]
+        pct = pl_total / p["start"] * 100 if p["start"] else 0
+        self._port_summary.config(
+            text=(f"النقد: {p['cash']:.2f} USD  |  قيمة الحيازات: {holdings_value:.2f} USD  |  "
+                  f"الإجمالي: {total:.2f} USD ({total*rate:.2f} SAR)\n"
+                  f"رأس المال: {p['start']:.2f} USD  |  "
+                  f"الربح/الخسارة: {pl_total:+.2f} USD ({pct:+.2f}%)"),
+            fg="#3fb950" if pl_total >= 0 else "#f85149")
+
+    def _reset_portfolio(self):
+        if messagebox.askyesno("إعادة تعيين", "هل تريد مسح المحفظة والبدء من جديد؟"):
+            self.portfolio = None
+            self.cfg["portfolio"] = None
+            save_config(self.cfg)
+            if hasattr(self, "_port_win"):
+                self._port_win.destroy()
+            self.open_portfolio()
+
+
+    # =========================================================
+    #  حاسبة "ماذا لو"
+    # =========================================================
+    def open_whatif(self):
+        ticker = self.ticker_var.get().strip().upper()
+        if not ticker:
+            messagebox.showinfo("تنبيه", "أدخل رمز سهم أولاً.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"ماذا لو - {ticker}")
+        win.geometry("560x520")
+        win.configure(bg=self.col_bg)
+
+        tk.Label(win, text=f"🧮 حاسبة ماذا لو — {ticker}", bg=self.col_bg, fg=self.col_accent,
+                 font=("Segoe UI", 15, "bold")).pack(pady=12)
+
+        frm = tk.Frame(win, bg=self.col_bg); frm.pack(pady=4)
+        tk.Label(frm, text="المبلغ المستثمَر ($):", bg=self.col_bg, fg=self.col_text,
+                 font=("Segoe UI", 11)).pack(side="left", padx=6)
+        amt_var = tk.StringVar(value="100")
+        tk.Entry(frm, textvariable=amt_var, width=12, justify="center", font=("Consolas", 12),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat",
+                 insertbackground=self.col_accent).pack(side="left", ipady=4)
+
+        out = tk.Text(win, bg=self.col_panel, fg=self.col_text, font=("Consolas", 11),
+                      relief="flat", wrap="word", padx=16, pady=16, height=18)
+        out.pack(fill="both", expand=True, padx=16, pady=12)
+        out.tag_configure("g", foreground="#3fb950")
+        out.tag_configure("r", foreground="#f85149")
+        out.tag_configure("t", foreground=self.col_accent, font=("Segoe UI", 12, "bold"))
+
+        def calc():
+            out.config(state="normal"); out.delete("1.0", "end")
+            try:
+                amount = float(amt_var.get())
+            except ValueError:
+                out.insert("end", "أدخل مبلغاً صحيحاً.\n"); out.config(state="disabled"); return
+            out.insert("end", "جاري الحساب ...\n"); out.config(state="disabled")
+            threading.Thread(target=worker, args=(amount,), daemon=True).start()
+
+        def worker(amount):
+            try:
+                price = get_price(ticker)
+                rate = usd_to_sar()
+                ind = self.last["ind"] if (self.last and self.last["ticker"] == ticker) else None
+                win.after(0, show, amount, price, rate, ind)
+            except Exception as e:
+                win.after(0, lambda: (out.config(state="normal"), out.delete("1.0", "end"),
+                                      out.insert("end", f"خطأ: {e}\n"), out.config(state="disabled")))
+
+        def show(amount, price, rate, ind):
+            out.config(state="normal"); out.delete("1.0", "end")
+            shares = amount / price
+            out.insert("end", f"السعر الحالي: {price:.2f}$  ({price*rate:.2f} ريال)\n")
+            out.insert("end", f"مبلغك {amount:.2f}$ يشتري ≈ {shares:.4f} سهم\n\n")
+            out.insert("end", "سيناريوهات الأرباح/الخسائر:\n", "t")
+
+            scenarios = [("+5%", 0.05), ("+10%", 0.10), ("+25%", 0.25), ("+50%", 0.50),
+                         ("-5%", -0.05), ("-10%", -0.10), ("-25%", -0.25)]
+            # أضف نقاط التوصية إن توفرت
+            if ind:
+                for label, lvl in (("الهدف (توصية)", ind["target"]),
+                                   ("وقف الخسارة (توصية)", ind["stop"])):
+                    pct = (lvl - price) / price
+                    scenarios.append((f"{label} @ {lvl:.2f}", pct))
+
+            for label, pct in scenarios:
+                new_val = amount * (1 + pct)
+                profit = new_val - amount
+                tag = "g" if profit >= 0 else "r"
+                sign = "+" if profit >= 0 else ""
+                out.insert("end",
+                    f"  {label:<22}: {new_val:,.2f}$  ({sign}{profit:,.2f}$ / {sign}{profit*rate:,.2f} ريال)\n",
+                    tag)
+            out.insert("end", "\n⚠️ أرقام افتراضية لأغراض توضيحية فقط، لا تضمن نتائج فعلية.\n", "r")
+            out.config(state="disabled")
+
+        tk.Button(frm, text="احسب", command=calc, bg=self.col_accent, fg="#0f1419",
+                  font=("Segoe UI", 11, "bold"), relief="flat", padx=18, cursor="hand2").pack(side="left", padx=8)
+        calc()
+
+    # =========================================================
+    #  المحفظة الافتراضية
+    # =========================================================
+    def open_portfolio(self):
+        p = self.cfg["portfolio"]
+        win = tk.Toplevel(self)
+        win.title("المحفظة الافتراضية")
+        win.geometry("820x640")
+        win.configure(bg=self.col_bg)
+
+        tk.Label(win, text="💼 المحفظة الافتراضية", bg=self.col_bg, fg=self.col_accent,
+                 font=("Segoe UI", 16, "bold")).pack(pady=10)
+
+        # ملخص علوي
+        summary = tk.Label(win, text="", bg=self.col_bg, fg=self.col_text,
+                           font=("Consolas", 12), justify="right")
+        summary.pack(pady=4)
+
+        # شريط التداول
+        trade = tk.Frame(win, bg=self.col_panel); trade.pack(fill="x", padx=16, pady=8)
+        tk.Label(trade, text="الرمز:", bg=self.col_panel, fg=self.col_text).pack(side="left", padx=4)
+        t_var = tk.StringVar(value=self.ticker_var.get().strip().upper() or "AAPL")
+        tk.Entry(trade, textvariable=t_var, width=8, justify="center", font=("Consolas", 11),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat").pack(side="left", padx=4, ipady=3)
+        tk.Label(trade, text="الكمية:", bg=self.col_panel, fg=self.col_text).pack(side="left", padx=4)
+        q_var = tk.StringVar(value="1")
+        tk.Entry(trade, textvariable=q_var, width=6, justify="center", font=("Consolas", 11),
+                 bg="#0b0f14", fg=self.col_accent, relief="flat").pack(side="left", padx=4, ipady=3)
+
+        tree = ttk.Treeview(win, columns=("الرمز", "كمية", "متوسط الشراء", "السعر الحالي", "القيمة", "ربح/خسارة"),
+                            show="headings", height=9)
+        for c in tree["columns"]:
+            tree.heading(c, text=c); tree.column(c, anchor="center", width=120)
+        tree.pack(fill="both", expand=True, padx=16, pady=8)
+
+        st = tk.Label(win, text="", bg=self.col_bg, fg="#8b949e", font=("Segoe UI", 10))
+        st.pack(pady=4)
+
+        def refresh_view():
+            for r in tree.get_children():
+                tree.delete(r)
+            st.config(text="جاري تحديث الأسعار ...", fg=self.col_accent)
+            threading.Thread(target=view_worker, daemon=True).start()
+
+        def view_worker():
+            rate = usd_to_sar()
+            rows, holdings_value = [], 0.0
+            for tk_sym, pos in p["positions"].items():
+                if pos["qty"] <= 0:
+                    continue
+                try:
+                    cur = get_price(tk_sym)
+                except Exception:
+                    cur = pos["avg"]
+                val = cur * pos["qty"]
+                holdings_value += val
+                pl = (cur - pos["avg"]) * pos["qty"]
+                rows.append((tk_sym, pos["qty"], f"{pos['avg']:.2f}", f"{cur:.2f}",
+                             f"{val:,.2f}$", f"{pl:+,.2f}$"))
+            win.after(0, lambda: fill_view(rows, holdings_value, rate))
+
+        def fill_view(rows, holdings_value, rate):
+            for row in rows:
+                tree.insert("", "end", values=row)
+            total = p["cash"] + holdings_value
+            pl_total = total - p["start_balance"]
+            summary.config(text=(
+                f"النقد: {p['cash']:,.2f}$   |   قيمة الأسهم: {holdings_value:,.2f}$   |   "
+                f"الإجمالي: {total:,.2f}$ ({total*rate:,.0f} ريال)\n"
+                f"الرصيد الابتدائي: {p['start_balance']:,.0f}$   |   "
+                f"إجمالي الربح/الخسارة: {pl_total:+,.2f}$ ({(pl_total/p['start_balance']*100):+.2f}%)"))
+            st.config(text="تم التحديث ✓", fg="#3fb950")
+
+        def do_buy():
+            sym = t_var.get().strip().upper()
+            try:
+                qty = int(q_var.get())
+            except ValueError:
+                return
+            if not sym or qty <= 0:
+                return
+            st.config(text="جاري التنفيذ ...", fg=self.col_accent)
+            threading.Thread(target=lambda: trade_worker(sym, qty, "buy"), daemon=True).start()
+
+        def do_sell():
+            sym = t_var.get().strip().upper()
+            try:
+                qty = int(q_var.get())
+            except ValueError:
+                return
+            if not sym or qty <= 0:
+                return
+            st.config(text="جاري التنفيذ ...", fg=self.col_accent)
+            threading.Thread(target=lambda: trade_worker(sym, qty, "sell"), daemon=True).start()
+
+        def trade_worker(sym, qty, side):
+            try:
+                price = get_price(sym)
+            except Exception as e:
+                win.after(0, lambda: st.config(text=f"تعذّر جلب السعر: {e}", fg="#f85149"))
+                return
+            win.after(0, lambda: execute(sym, qty, side, price))
+
+        def execute(sym, qty, side, price):
+            pos = p["positions"].get(sym, {"qty": 0, "avg": 0.0})
+            if side == "buy":
+                cost = price * qty
+                if cost > p["cash"]:
+                    st.config(text="النقد غير كافٍ لهذه الصفقة.", fg="#f85149")
+                    return
+                new_qty = pos["qty"] + qty
+                pos["avg"] = (pos["avg"] * pos["qty"] + cost) / new_qty
+                pos["qty"] = new_qty
+                p["cash"] -= cost
+            else:  # sell
+                if qty > pos["qty"]:
+                    st.config(text="الكمية أكبر من المملوكة.", fg="#f85149")
+                    return
+                p["cash"] += price * qty
+                pos["qty"] -= qty
+            p["positions"][sym] = pos
+            p["trades"].append({
+                "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "side": side, "ticker": sym, "qty": qty, "price": round(price, 2)})
+            save_config(self.cfg)
+            st.config(text=f"تم تنفيذ {'شراء' if side=='buy' else 'بيع'} {qty} {sym} @ {price:.2f}$ ✓",
+                      fg="#3fb950")
+            refresh_view()
+
+        def edit_balance():
+            from tkinter import simpledialog
+            val = simpledialog.askfloat("تعديل الرصيد",
+                                        "الرصيد الابتدائي الجديد ($):",
+                                        initialvalue=p["start_balance"], parent=win)
+            if val and val > 0:
+                p["start_balance"] = val
+                p["cash"] = val
+                p["positions"] = {}
+                p["trades"] = []
+                save_config(self.cfg)
+                refresh_view()
+
+        tk.Button(trade, text="🟢 شراء", command=do_buy, bg="#238636", fg="white",
+                  font=("Segoe UI", 11, "bold"), relief="flat", padx=16, cursor="hand2").pack(side="left", padx=6)
+        tk.Button(trade, text="🔴 بيع", command=do_sell, bg="#da3633", fg="white",
+                  font=("Segoe UI", 11, "bold"), relief="flat", padx=16, cursor="hand2").pack(side="left", padx=6)
+        tk.Button(trade, text="🔄 تحديث الأسعار", command=refresh_view, bg="#30363d", fg=self.col_text,
+                  font=("Segoe UI", 10, "bold"), relief="flat", padx=12, cursor="hand2").pack(side="right", padx=6)
+        tk.Button(trade, text="⚙️ تعديل الرصيد", command=edit_balance, bg="#30363d", fg="#d29922",
+                  font=("Segoe UI", 10, "bold"), relief="flat", padx=12, cursor="hand2").pack(side="right", padx=6)
+
+        refresh_view()
 
 
 if __name__ == "__main__":
