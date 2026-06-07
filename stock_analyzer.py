@@ -327,6 +327,31 @@ def shariah_screen(info, bs):
             )
             result["passed"] = False
 
+    # 4) نسبة الذمم المدينة (إن توفرت)
+    receivables = _get_row(bs, ["Net Receivables", "Receivables", "Accounts Receivable"])
+    if receivables is not None and market_cap:
+        rec_ratio = receivables / market_cap
+        result["ratios"]["نسبة الذمم المدينة"] = rec_ratio
+        if rec_ratio >= 0.49:
+            result["flags"].append(
+                f"نسبة الذمم المدينة {rec_ratio:.1%} تتجاوز الحد 49%")
+            result["passed"] = False
+
+    # 5) تطهير الأرباح (تقدير نسبة الدخل من الفوائد إن توفر)
+    interest_income = info.get("interestIncome")
+    total_revenue = info.get("totalRevenue")
+    if interest_income and total_revenue:
+        haram_ratio = abs(interest_income) / total_revenue
+        result["ratios"]["نسبة الدخل من الفوائد"] = haram_ratio
+        result["purification_per_share"] = None
+        eps = info.get("trailingEps")
+        if eps:
+            result["purification_per_share"] = eps * haram_ratio
+        if haram_ratio >= SHARIAH["max_haram_income"]:
+            result["flags"].append(
+                f"نسبة الدخل المحرّم {haram_ratio:.1%} تتجاوز {SHARIAH['max_haram_income']:.0%}")
+            result["passed"] = False
+
     # الخلاصة
     if not result["flags"]:
         result["verdict"] = "✅ متوافق مبدئياً مع الشريعة"
@@ -466,6 +491,147 @@ def auto_trade_decision(ind, shariah, mode, holding_qty):
 
 
 # =============================================================
+#  نظام الإشارات الموزون + درجة الثقة
+# =============================================================
+def weighted_signal(ind, shariah, fundamentals=None):
+    """
+    يدمج إشارات متعددة بأوزان ويُخرج درجة من -100 إلى +100 ودرجة ثقة.
+    يطبّق منهج: جودة أساسية (اختيار) + اتجاه/زخم (توقيت).
+    """
+    c = ind["current"]
+    signals = []  # (الاسم, القيمة -1..+1, الوزن)
+
+    # --- التوقيت: الاتجاه والزخم ---
+    if ind["sma200"]:
+        signals.append(("الاتجاه الطويل (200)", 1 if c > ind["sma200"] else -1, 25))
+    signals.append(("الاتجاه المتوسط (50)", 1 if c > ind["sma50"] else -1, 20))
+    signals.append(("زخم MACD", 1 if ind["macd"] > ind["macd_signal"] else -1, 20))
+
+    rsi = ind["rsi"]
+    if rsi < 30:
+        signals.append(("RSI (تشبّع بيعي)", 1, 15))
+    elif rsi > 70:
+        signals.append(("RSI (تشبّع شرائي)", -1, 15))
+    else:
+        signals.append(("RSI (محايد)", (50 - abs(rsi - 50)) / 50 * 0.3, 15))
+
+    # موقع السعر ضمن نطاق بولينجر
+    if ind.get("bb_upper") and ind.get("bb_lower"):
+        rng = ind["bb_upper"] - ind["bb_lower"]
+        if rng > 0:
+            pos = (c - ind["bb_lower"]) / rng  # 0 سفلي .. 1 علوي
+            signals.append(("موقع بولينجر", (0.5 - pos) * 2, 10))
+
+    # --- الجودة الأساسية (إن توفرت) ---
+    if fundamentals:
+        pe = fundamentals.get("pe")
+        if pe and pe > 0:
+            signals.append(("التقييم P/E", 1 if pe < 25 else -1 if pe > 40 else 0, 10))
+        roe = fundamentals.get("roe")
+        if roe is not None:
+            signals.append(("العائد على حقوق الملكية", 1 if roe > 0.15 else -1 if roe < 0 else 0, 10))
+
+    total_w = sum(w for _, _, w in signals)
+    raw = sum(v * w for _, v, w in signals)
+    score = (raw / total_w) * 100 if total_w else 0
+
+    # درجة الثقة: مدى اتفاق الإشارات
+    agree = sum(w for _, v, w in signals if (v > 0) == (score > 0) and v != 0)
+    confidence = (agree / total_w * 100) if total_w else 0
+
+    # عقوبة شرعية
+    if not shariah.get("passed", True):
+        score = min(score, -20)
+
+    if score >= 25:
+        label = "🟢 إيجابي قوي" if score >= 50 else "🟢 إيجابي"
+    elif score <= -25:
+        label = "🔴 سلبي قوي" if score <= -50 else "🔴 سلبي"
+    else:
+        label = "🟡 حيادي"
+
+    return {"score": round(score, 1), "confidence": round(confidence, 1),
+            "label": label, "signals": signals}
+
+
+# =============================================================
+#  الاختبار الرجعي (Backtesting)
+# =============================================================
+def backtest(hist, mode="trend", start_cash=10000.0):
+    """
+    يحاكي استراتيجية على بيانات تاريخية ويقارنها بالشراء والاحتفاظ (Buy&Hold).
+    mode='trend': شراء فوق متوسط 50 وزخم MACD، بيع عند الكسر.
+    يرجع منحنى رأس المال + إحصاءات الأداء.
+    """
+    close = hist["Close"].copy()
+    if len(close) < 60:
+        raise ValueError("بيانات غير كافية للاختبار الرجعي.")
+
+    sma50 = close.rolling(50).mean()
+    macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    rsi_series = rsi(close)
+
+    cash = start_cash
+    shares = 0.0
+    equity_curve = []
+    trades = 0
+    wins = 0
+    entry_price = 0.0
+
+    for i in range(50, len(close)):
+        price = close.iloc[i]
+        in_uptrend = price > sma50.iloc[i]
+        macd_up = macd_line.iloc[i] > signal_line.iloc[i]
+        r = rsi_series.iloc[i]
+
+        if mode == "trend":
+            buy = in_uptrend and macd_up
+            sell = (not in_uptrend) or (r > 75)
+        else:  # mean-reversion
+            buy = r < 35 and macd_up
+            sell = r > 65
+
+        if shares == 0 and buy:
+            shares = cash / price
+            cash = 0
+            entry_price = price
+            trades += 1
+        elif shares > 0 and sell:
+            cash = shares * price
+            if price > entry_price:
+                wins += 1
+            shares = 0
+
+        equity_curve.append(cash + shares * price)
+
+    final = cash + shares * close.iloc[-1]
+    bh = start_cash * (close.iloc[-1] / close.iloc[50])  # شراء واحتفاظ
+
+    strat_return = (final / start_cash - 1) * 100
+    bh_return = (bh / start_cash - 1) * 100
+
+    # أقصى تراجع
+    eq = pd.Series(equity_curve)
+    roll_max = eq.cummax()
+    drawdown = ((eq - roll_max) / roll_max * 100).min()
+
+    win_rate = (wins / trades * 100) if trades else 0
+
+    return {
+        "equity_curve": equity_curve,
+        "dates": list(close.index[50:]),
+        "final": final,
+        "strat_return": strat_return,
+        "bh_return": bh_return,
+        "trades": trades,
+        "win_rate": win_rate,
+        "max_drawdown": drawdown,
+        "outperformed": strat_return > bh_return,
+    }
+
+
+# =============================================================
 #  واجهة المستخدم الرسومية
 # =============================================================
 class StockApp(tk.Tk):
@@ -596,15 +762,10 @@ class StockApp(tk.Tk):
                                  relief="flat", padx=14, pady=6, cursor="hand2")
         self.bot_btn.pack(side="left", padx=4)
 
-        self.sim_btn = tk.Button(entry_frame, text="🧮 محاكاة", command=self.open_simulator,
-                                 bg="#30363d", fg="#2dd4bf", font=("Segoe UI", 11, "bold"),
-                                 relief="flat", padx=14, pady=6, cursor="hand2")
-        self.sim_btn.pack(side="left", padx=4)
-
-        self.port_btn = tk.Button(entry_frame, text="💼 المحفظة", command=self.open_portfolio,
-                                  bg="#30363d", fg="#d29922", font=("Segoe UI", 11, "bold"),
-                                  relief="flat", padx=14, pady=6, cursor="hand2")
-        self.port_btn.pack(side="left", padx=4)
+        self.bt_btn = tk.Button(entry_frame, text="📊 اختبار رجعي", command=self.open_backtest,
+                                bg="#30363d", fg="#56d364", font=("Segoe UI", 11, "bold"),
+                                relief="flat", padx=14, pady=6, cursor="hand2")
+        self.bt_btn.pack(side="left", padx=4)
 
         # صف ثانٍ: المفضلة والتحديث التلقائي
         bar = tk.Frame(self, bg=self.col_bg)
@@ -709,7 +870,12 @@ class StockApp(tk.Tk):
             shariah = shariah_screen(info, bs)
             ind = technical_analysis(hist)
             verdict, score, reasons = build_recommendation(ind, shariah)
-            self.after(0, self._render, ticker, hist, info, shariah, ind, verdict, score, reasons)
+            fundamentals = {
+                "pe": info.get("trailingPE"),
+                "roe": info.get("returnOnEquity"),
+            }
+            wsig = weighted_signal(ind, shariah, fundamentals)
+            self.after(0, self._render, ticker, hist, info, shariah, ind, verdict, score, reasons, wsig)
         except Exception as e:
             self.after(0, self._error, str(e))
 
@@ -718,7 +884,7 @@ class StockApp(tk.Tk):
         self.status.config(text=f"خطأ: {msg}", fg="#f85149")
         messagebox.showerror("خطأ في التحليل", msg)
 
-    def _render(self, ticker, hist, info, shariah, ind, verdict, score, reasons):
+    def _render(self, ticker, hist, info, shariah, ind, verdict, score, reasons, wsig=None):
         self.btn.config(state="normal", text="🔍 حلّل")
         self.pdf_btn.config(state="normal")
         self.status.config(text=f"اكتمل تحليل {ticker} ✓", fg="#3fb950")
@@ -748,6 +914,10 @@ class StockApp(tk.Tk):
         L.append(("◆ التوصية الآلية الملخصة:", "title"))
         tag = "good" if "🟢" in verdict else "bad" if "🔴" in verdict else "warn"
         L.append((f"   {verdict}   (نقاط التقييم: {score})", tag))
+        if wsig:
+            wtag = "good" if wsig["score"] > 0 else "bad" if wsig["score"] < 0 else "warn"
+            L.append((f"   درجة الإشارة المركّبة: {wsig['score']:+.0f}/100  {wsig['label']}", wtag))
+            L.append((f"   درجة الثقة (اتفاق المؤشرات): {wsig['confidence']:.0f}%", None))
         L.append(("", None))
         L.append(("◆ الأسباب:", None))
         for r in reasons:
@@ -1945,6 +2115,90 @@ class StockApp(tk.Tk):
 
         else:
             self._bot_log(f"⏸ انتظار {sym} @ {price:.2f}$ — {reason}", "hold")
+
+
+    # =========================================================
+    #  نافذة الاختبار الرجعي
+    # =========================================================
+    def open_backtest(self):
+        ticker = self.ticker_var.get().strip().upper()
+        if not ticker:
+            messagebox.showinfo("تنبيه", "أدخل رمز سهم أولاً.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"الاختبار الرجعي - {ticker}")
+        win.geometry("860x680")
+        win.configure(bg=self.col_bg)
+
+        tk.Label(win, text=f"📊 الاختبار الرجعي — {ticker}", bg=self.col_bg,
+                 fg="#56d364", font=("Segoe UI", 16, "bold")).pack(pady=10)
+
+        ctrl = tk.Frame(win, bg=self.col_bg); ctrl.pack(pady=4)
+        tk.Label(ctrl, text="الاستراتيجية:", bg=self.col_bg, fg=self.col_text,
+                 font=("Segoe UI", 11)).pack(side="left", padx=6)
+        strat_var = tk.StringVar(value="تتبّع الاتجاه")
+        ttk.Combobox(ctrl, textvariable=strat_var,
+                     values=["تتبّع الاتجاه", "الارتداد (عكسي)"],
+                     state="readonly", width=14).pack(side="left", padx=6)
+
+        info_lbl = tk.Label(win, text="", bg=self.col_bg, fg=self.col_text,
+                            font=("Consolas", 11), justify="right")
+        info_lbl.pack(pady=8)
+
+        chart_box = tk.Frame(win, bg=self.col_panel)
+        chart_box.pack(fill="both", expand=True, padx=16, pady=8)
+
+        st = tk.Label(win, text="", bg=self.col_bg, fg="#8b949e", font=("Segoe UI", 10))
+        st.pack(pady=4)
+
+        def run():
+            st.config(text="جاري التحميل والاختبار ...", fg=self.col_accent)
+            mode = "trend" if strat_var.get() == "تتبّع الاتجاه" else "revert"
+            threading.Thread(target=worker, args=(mode,), daemon=True).start()
+
+        def worker(mode):
+            try:
+                tkobj = yf.Ticker(ticker)
+                hist = tkobj.history(period="2y")
+                res = backtest(hist, mode=mode, start_cash=10000)
+                win.after(0, show, res)
+            except Exception as e:
+                win.after(0, lambda: st.config(text=f"خطأ: {e}", fg="#f85149"))
+
+        def show(res):
+            verdict = "✅ تفوّقت على السوق" if res["outperformed"] else "❌ لم تتفوّق على الشراء والاحتفاظ"
+            info_lbl.config(text=(
+                f"عائد الاستراتيجية: {res['strat_return']:+.1f}%    |    "
+                f"الشراء والاحتفاظ: {res['bh_return']:+.1f}%\n"
+                f"عدد الصفقات: {res['trades']}    |    نسبة الصفقات الرابحة: {res['win_rate']:.0f}%    |    "
+                f"أقصى تراجع: {res['max_drawdown']:.1f}%\n{verdict}"))
+            for w in chart_box.winfo_children():
+                w.destroy()
+            fig = Figure(figsize=(8, 4.2), dpi=100, facecolor="#1a2027")
+            ax = fig.add_subplot(111, facecolor="#0f1419")
+            ax.plot(res["dates"], res["equity_curve"], color="#56d364", lw=1.5, label="الاستراتيجية")
+            # منحنى الشراء والاحتفاظ
+            start = res["equity_curve"][0]
+            bh_curve = [start * (1 + res["bh_return"]/100 * i/len(res["equity_curve"]))
+                        for i in range(len(res["equity_curve"]))]
+            ax.plot(res["dates"], bh_curve, color="#8b949e", lw=1, ls="--", label="شراء واحتفاظ")
+            ax.set_title("نمو رأس المال (10,000$ ابتدائي)", color="#e6edf3")
+            ax.tick_params(colors="#8b949e")
+            for s in ax.spines.values():
+                s.set_color("#30363d")
+            ax.legend(facecolor="#1a2027", edgecolor="#30363d", labelcolor="#e6edf3")
+            ax.grid(True, color="#21262d", lw=0.5)
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=chart_box)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            st.config(text="اكتمل الاختبار ✓", fg="#3fb950")
+
+        tk.Button(ctrl, text="ابدأ الاختبار", command=run, bg="#56d364", fg="#0f1419",
+                  font=("Segoe UI", 11, "bold"), relief="flat", padx=18, cursor="hand2").pack(side="left", padx=8)
+        tk.Label(win, text="⚠️ نتائج الماضي لا تضمن المستقبل. الاختبار لا يشمل العمولات والانزلاق السعري.",
+                 bg=self.col_bg, fg="#d29922", font=("Segoe UI", 9)).pack(pady=4)
+        run()
 
 
 if __name__ == "__main__":
