@@ -242,6 +242,49 @@ def usd_to_sar():
     return rate
 
 
+def market_status():
+    """
+    حالة السوق الأمريكي (NYSE/NASDAQ) حسب توقيت نيويورك.
+    التداول الرسمي: 9:30 ص - 4:00 م بتوقيت الشرق، أيام الإثنين-الجمعة.
+    يرجع dict فيه: open(bool), label, color, ny_time, next_event.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        ny = dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        # احتياط: تقدير يدوي (الشرق الأمريكي = UTC-4 صيفاً تقريباً)
+        ny = dt.datetime.utcnow() - dt.timedelta(hours=4)
+
+    wd = ny.weekday()  # 0=الإثنين .. 6=الأحد
+    t = ny.time()
+    open_t = dt.time(9, 30)
+    close_t = dt.time(16, 0)
+    pre_t = dt.time(4, 0)
+    post_t = dt.time(20, 0)
+    ny_str = ny.strftime("%I:%M %p")
+
+    is_weekday = wd < 5
+
+    if is_weekday and open_t <= t < close_t:
+        return {"open": True, "label": "🟢 السوق مفتوح", "color": "#3fb950",
+                "ny_time": ny_str, "next_event": "يغلق 4:00 م (نيويورك)"}
+    if is_weekday and pre_t <= t < open_t:
+        return {"open": False, "label": "🟡 ما قبل الافتتاح", "color": "#d29922",
+                "ny_time": ny_str, "next_event": "يفتح 9:30 ص (نيويورك)"}
+    if is_weekday and close_t <= t < post_t:
+        return {"open": False, "label": "🟡 ما بعد الإغلاق", "color": "#d29922",
+                "ny_time": ny_str, "next_event": "تداول ممتد حتى 8:00 م"}
+    # مغلق
+    if not is_weekday:
+        nxt = "يفتح الإثنين 9:30 ص (نيويورك)"
+    elif t < pre_t:
+        nxt = "يفتح 9:30 ص (نيويورك)"
+    else:
+        nxt = "يفتح غداً 9:30 ص (نيويورك)"
+    return {"open": False, "label": "🔴 السوق مغلق", "color": "#f85149",
+            "ny_time": ny_str, "next_event": nxt}
+
+
 def fetch_usd_sar():
     """جلب سعر صرف الدولار مقابل الريال السعودي (حي من السوق)."""
     try:
@@ -673,6 +716,7 @@ class StockApp(tk.Tk):
         self.last = None
         self._refresh_fav_list()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._update_market_status()
 
         if yf is None:
             messagebox.showwarning(
@@ -693,6 +737,17 @@ class StockApp(tk.Tk):
                     pass
         self.destroy()
 
+    def _update_market_status(self):
+        try:
+            ms = market_status()
+            self.mkt_lbl.config(
+                text=f"{ms['label']}  •  {ms['ny_time']} نيويورك  •  {ms['next_event']}",
+                fg=ms["color"])
+        except Exception:
+            pass
+        # تحديث كل 30 ثانية
+        self.after(30000, self._update_market_status)
+
     def _build_styles(self):
         style = ttk.Style(self)
         try:
@@ -712,6 +767,10 @@ class StockApp(tk.Tk):
         tk.Label(head, text="📊  محلل الأسهم الأمريكية",
                  bg=self.col_bg, fg=self.col_accent,
                  font=("Segoe UI", 20, "bold")).pack(side="left")
+
+        self.mkt_lbl = tk.Label(head, text="", bg=self.col_bg, fg="#8b949e",
+                                font=("Segoe UI", 11, "bold"))
+        self.mkt_lbl.pack(side="left", padx=16)
 
         entry_frame = tk.Frame(head, bg=self.col_bg)
         entry_frame.pack(side="right")
